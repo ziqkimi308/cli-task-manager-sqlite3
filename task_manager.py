@@ -126,7 +126,8 @@ def get_task(task_id: int) -> dict | None:
     """
 
 	with get_db_connection() as conn:
-		row = conn.execute('SELECT * FROM tasks WHERE id = ?', task_id).fetchone()
+		# SQLite placeholders (?) always expect a tuple/list of values, so (task_id,) is required even for one parameter.
+		row = conn.execute('SELECT * FROM tasks WHERE id = ?', (task_id,)).fetchone()
 
 		return dict(row) if row else None
 
@@ -183,7 +184,7 @@ def delete_task(task_id: int) -> bool:
     # - cursor.rowcount → confirms deletion
 
 	with get_db_connection() as conn:
-		cursor = conn.execute('DELETE FROM tasks WHERE id = ?', task_id)
+		cursor = conn.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
 		conn.commit()
 
 		return cursor.rowcount > 0
@@ -338,7 +339,7 @@ def format_task(task: dict, show_id: bool = True) -> str:
 
 	return '\n'.join(lines)
 
-def format_task_compat(task: dict) -> str:
+def format_task_compact(task: dict) -> str:
 	"""
     Format a single task into a compact, one-line string.
 
@@ -356,7 +357,7 @@ def format_task_compat(task: dict) -> str:
         str: A concise single-line string with symbolic status/priority.
     """
 
-	status_char = {'pending': '○', 'in-progress': '◔', 'completed': '✔'}.get(task['status', '?'])
+	status_char = {'pending': '○', 'in-progress': '◔', 'completed': '✔'}.get(task['status'], '?')
 
 	status_color = {'pending': Fore.YELLOW, 'in-progress': Fore.BLUE, 'completed': Fore.GREEN}.get(task['status'], '')
 
@@ -372,3 +373,183 @@ def format_task_compat(task: dict) -> str:
 	due_part = f"({task['due_date']})" if task['due_date'] else ''
 
 	return f"{id_part} {status_part} {priority_part} {title_part:<42} {due_part}"
+
+def handle_add(args):
+	# Handle wrong date format
+	if args.due and not validate_date(args.due):
+		print(colorize("Error: Due date must be in YYYY-MM-DD format.", Fore.RED), file=sys.stderr)
+		return 1
+	
+	task_id = add_task(
+		title=args.title,
+        description=args.description,
+        due_date=args.due,
+        priority=args.priority
+		)
+	print(colorize(f"✓ Task added with ID: {task_id}", Fore.GREEN))
+	return 0
+	
+def handle_list(args):
+	tasks = list_tasks(
+        status=args.status,
+        priority=args.priority,
+        due_before=args.due_before,
+        limit=args.limit
+    )
+
+	if not tasks:
+		print(colorize("No tasks found.", Fore.YELLOW))
+		return 0
+
+	print(colorize(f"\nFound {len(tasks)} task(s):\n", Style.BRIGHT))
+	for task in tasks:
+		print(format_task_compact(task))
+		
+	return 0
+
+def handle_show(args):
+	task = get_task(args.id)
+	if not task:
+		print(colorize(f"Error: Task with ID {args.id} not found.", Fore.RED), file=sys.stderr)
+		return 1
+
+	print("\n" + format_task(task))
+	return 0
+
+def handle_update(args):
+	task = get_task(args.id)
+	if not task:
+		print(colorize(f"Error: Task with ID {args.id} not found.", Fore.RED), file=sys.stderr)
+		return 1
+	
+	updates = {}
+	if args.title is not None:
+		updates['title'] = args.title
+	if args.description is not None:
+		updates['description'] = args.description if args.description != '' else None
+	if args.status is not None:
+		updates['status'] = args.status
+	if args.due is not None:
+			if args.due and not validate_date(args.due):
+				print(colorize("Error: Due date must be in YYYY-MM-DD format.", Fore.RED), file=sys.stderr)
+				return 1
+			updates['due_date'] = args.due
+	if args.priority is not None:
+			updates['priority'] = args.priority
+	
+	# extra layer safety guard before update query
+	if not updates:
+		print(colorize("No updates specified.", Fore.YELLOW))
+		return 1
+	
+	# (**updates) is unpacking the keyword args
+	if update_task(args.id, **updates):
+		print(colorize(f"✓ Task {args.id} updated.", Fore.GREEN))
+		return 0
+	else:
+		print(colorize(f"Error: Failed to update task {args.id}.", Fore.RED), file=sys.stderr)
+		return 1
+
+def handle_complete(args):
+	if update_task(args.id, status='completed'):
+		print(colorize(f"✓ Task {args.id} marked as completed.", Fore.GREEN))
+		return 0
+	else:
+		print(colorize(f"Error: Task {args.id} not found.", Fore.RED), file=sys.stderr)
+		return 1
+
+def handle_delete(args):
+	if not args.force:
+		confirm = input(colorize(f"Are you sure you want to delete task {args.id}? [y/N] ", Fore.YELLOW))
+		if confirm.lower() != 'y':
+			print("Deletion cancelled.")
+			return 0
+		
+	if delete_task(args.id):
+		print(colorize(f"✓ Task {args.id} deleted.", Fore.GREEN))
+		return 0
+	else:
+		print(colorize(f"Error: Task {args.id} not found.", Fore.RED), file=sys.stderr)
+		return 1
+
+
+def main():
+	init_db()
+
+	parser = argparse.ArgumentParser(
+		description="CLI Task Manager with SQLite",
+		epilog="""
+Examples:
+  # Add a task
+  task_manager add "Finish report" --priority high --due 2026-12-31
+
+  # List all pending tasks
+  task_manager list --status pending
+
+  # Show task details
+  task_manager show 3
+
+  # Update a task
+  task_manager update 3 --title "Updated title" --priority medium
+
+  # Mark as complete
+  task_manager complete 3
+
+  # Delete a task
+  task_manager delete 3
+""",
+formatter_class=argparse.RawDescriptionHelpFormatter,
+	)
+
+	subparsers = parser.add_subparsers(dest='command', required=True, help='Sub-commands')
+
+	# Add subcommands and arguments
+	# add
+	add_parser = subparsers.add_parser("add", help='Add a new task')
+	add_parser.add_argument('title', help='Task title')
+	add_parser.add_argument('-d', '--description', help='Task description')
+	add_parser.add_argument('--due', help='Due date (YYYY-MM-DD)')
+	add_parser.add_argument('-p', '--priority', choices=['low', 'medium', 'high'], default='medium', help='Task priority (default: medium)')
+	# without this, you will have to manually write conditional logic to choose which func for which subcommand.
+	add_parser.set_defaults(func=handle_add)
+
+	# list
+	list_parser = subparsers.add_parser('list', help='List tasks')
+	list_parser.add_argument('-s', '--status', choices=['pending', 'in-progress', 'completed'], help='Filter by status')
+	list_parser.add_argument('-p', '--priority', choices=['low', 'medium', 'high'], help='Filter by priority')
+	list_parser.add_argument('--due-before', help='Show tasks due on or before this date (YYYY-MM-DD)')
+	list_parser.add_argument('-n', '--limit', type=int, help='Limit number of results')
+	list_parser.set_defaults(func=handle_list)
+
+	# show
+	show_parser = subparsers.add_parser('show', help='Show task details')
+	show_parser.add_argument('id', type=int, help='Task ID')
+	show_parser.set_defaults(func=handle_show)
+
+	# update
+	update_parser = subparsers.add_parser('update', help='Update a task')
+	update_parser.add_argument('id', type=int, help='Task ID')
+	update_parser.add_argument('-t', '--title', help='New title')
+	update_parser.add_argument('-d', '--description', nargs='?', const='', help='New description (use empty string to clear)')
+	update_parser.add_argument('--due', help='New due date (YYYY-MM-DD)')
+	update_parser.add_argument('--status', choices=['pending', 'in-progress', 'completed'], help='New status')
+	update_parser.add_argument('-p', '--priority', choices=['low', 'medium', 'high'], help='New priority')
+	update_parser.set_defaults(func=handle_update)
+
+	# complete
+	complete_parser = subparsers.add_parser('complete', help='Mark task as completed')
+	complete_parser.add_argument('id', type=int, help='Task ID')
+	complete_parser.set_defaults(func=handle_complete)
+
+	# delete
+	delete_parser = subparsers.add_parser('delete', help='Delete a task')
+	delete_parser.add_argument('id', type=int, help='Task ID')
+	delete_parser.add_argument('-f', '--force', action='store_true', help='Skip confirmation prompt')
+	delete_parser.set_defaults(func=handle_delete)
+
+	# parse agrs
+	args = parser.parse_args()
+	sys.exit(args.func(args))
+
+if __name__ == '__main__':
+	main()
